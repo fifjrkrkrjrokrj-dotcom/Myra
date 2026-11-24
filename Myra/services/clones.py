@@ -1,0 +1,497 @@
+"""
+Cloned bots.
+
+Any user can host their own bot from the main bot with ``/clone <bot_token>``.
+A clone runs **inside the same process** as the main bot (cheap, no extra
+interpreter) but with its own Telegram client and its own bot token, so it can
+chat in its own groups and DMs.
+
+Deliberately **shared** between the main bot and every clone:
+
+    * the trained Hinglish database (``Word.WordDb``)
+    * the Gemini and OpenAI API keys
+    * **the whole admin surface**: one owner (``config.OWNER_ID``), one admin
+      list, one set of userbots/groups/settings — see :mod:`Myra.database.scope`
+
+so every clone that chats also makes the shared brain smarter — more reach,
+better database. Cloning gives reach, **not control**: ``/admin`` belongs to the
+main owner and the admins the owner added, in every bot, and always shows the
+same shared data.
+
+How the handlers work
+---------------------
+The clone's dispatcher runs the *same* handlers as the main bot. They are copied
+once and every callback is wrapped so it executes with the clone's scope in a
+ContextVar (:mod:`Myra.database.scope`). That keeps a clone's own chat serving
+isolated, while the admin-surface handlers opt into the global view with
+``@global_scope``.
+"""
+
+import functools
+import re
+import time
+from collections import OrderedDict
+from uuid import uuid4
+
+from pyrogram import Client
+from pyrogram.enums import ParseMode
+from pyrogram.session import Auth
+
+from Myra import config, LOGGER, DC_PROD_IPV4, DC_PROD_IPV6
+from Myra.database import bots as botdb
+from Myra.database.scope import MAIN_SCOPE, clone_scope, reset_scope, set_scope
+
+TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_\-]{30,}$")
+
+
+class CloneBotClient(Client):
+    """
+    Telegram client for cloned bots.
+    Directs new authorizations to DC 5 (or configured target DC) to avoid DC 2's
+    intermittent 500 RPC_CALL_FAIL on ImportBotAuthorization.
+    """
+    def __init__(self, *args, target_dc: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_dc = target_dc
+
+    async def load_session(self):
+        await self.storage.open()
+        session_empty = any([
+            await self.storage.test_mode() is None,
+            await self.storage.auth_key() is None,
+            await self.storage.user_id() is None,
+            await self.storage.is_bot() is None
+        ])
+        if session_empty:
+            if not self.api_id or not self.api_hash:
+                raise AttributeError("The API key is required for new authorizations.")
+            await self.storage.api_id(self.api_id)
+            chosen_dc = getattr(self, "target_dc", getattr(config, "TELEGRAM_DC", 5))
+            if self.test_mode:
+                ip = "149.154.167.40"
+                port = 80
+            else:
+                ip = (DC_PROD_IPV6 if self.ipv6 else DC_PROD_IPV4).get(chosen_dc, "91.108.56.130")
+                port = 443
+
+            await self.storage.dc_id(chosen_dc)
+            await self.storage.server_address(ip)
+            await self.storage.port(port)
+            await self.storage.date(0)
+            await self.storage.test_mode(self.test_mode)
+
+            LOGGER.info(f"🌐 Creating MTProto Auth Key for clone on DC {chosen_dc} ({ip}:{port})...")
+            auth_key = await Auth(
+                self,
+                await self.storage.dc_id(),
+                await self.storage.server_address(),
+                await self.storage.port(),
+                await self.storage.test_mode()
+            ).create()
+            await self.storage.auth_key(auth_key)
+            await self.storage.user_id(None)
+            await self.storage.is_bot(None)
+        else:
+            await super().load_session()
+
+# scope -> live Client (main bot is not stored here, see bot_client_for)
+CLIENTS: dict = {}
+
+# scope -> asyncio.Lock, so a clone is never started twice in parallel
+_LOCKS: dict = {}
+
+
+def _lock_for(scope: str):
+    import asyncio
+
+    lock = _LOCKS.get(scope)
+    if lock is None:
+        lock = _LOCKS[scope] = asyncio.Lock()
+    return lock
+
+
+def _full_name(me) -> str:
+    name = f"{me.first_name or ''} {(me.last_name or '')}".strip()
+    return name or (me.username or str(me.id))
+
+
+def attach_bot_attrs(client, me):
+    """Give a clone client the same convenience attributes as ``Myra``."""
+    client.id = me.id
+    client.name = _full_name(me)
+    client.username = me.username
+    client.mention = me.mention
+    client.me = me
+    return client
+
+
+def bot_client_for(scope: str = None):
+    """The bot client that serves a scope (the main bot for ``main``)."""
+    from Myra.database.scope import current_scope
+
+    scope = scope or current_scope()
+    if scope == MAIN_SCOPE:
+        from Myra import Myra as main_client
+
+        return main_client
+    return CLIENTS.get(scope)
+
+
+def running_scopes() -> list:
+    """Every scope that currently has a live bot client (main included)."""
+    scopes = [MAIN_SCOPE]
+    scopes += [scope for scope, client in CLIENTS.items() if client is not None]
+    return scopes
+
+
+# ── handler wrapping ───────────────────────────────────────────────────────
+def wrap_callback(callback, scope: str):
+    @functools.wraps(callback)
+    async def wrapper(client, update, *args, **kwargs):
+        token = set_scope(scope)
+        try:
+            return await callback(client, update, *args, **kwargs)
+        finally:
+            reset_scope(token)
+
+    return wrapper
+
+
+def wrapped_handlers(source_groups, scope: str) -> "OrderedDict":
+    """
+    Copy the main bot's handler groups for a clone.
+
+    Every callback is wrapped so it runs with ``scope``; everything else
+    (filters, group order, propagation rules) stays identical.
+    """
+    groups = OrderedDict()
+    for group, handlers in source_groups.items():
+        copied = []
+        for handler in handlers:
+            callback = wrap_callback(handler.callback, scope)
+            new_handler = None
+            try:
+                new_handler = type(handler)(callback=callback, filters=handler.filters)
+            except TypeError:
+                try:
+                    new_handler = type(handler)(callback)
+                except Exception:  # noqa: BLE001
+                    new_handler = None
+            copied.append(new_handler or handler)
+        groups[group] = copied
+    return groups
+
+
+# ── manager ────────────────────────────────────────────────────────────────
+class CloneManager:
+    """Starts / stops the cloned bots of the main process."""
+
+    def __init__(self):
+        self._source_groups = None
+        self.started = False
+
+    # -- wiring ------------------------------------------------------------
+    def capture_handlers(self):
+        """
+        Snapshot the main bot's handler groups.
+
+        Must be called *after* every module has been imported (the ``on_cmd`` /
+        ``on_message`` decorators register asynchronously), see
+        :func:`start_all`.
+        """
+        from Myra import Myra as main_bot
+
+        if main_bot is None or main_bot.dispatcher is None:
+            return None
+        self._source_groups = main_bot.dispatcher.groups
+        return self._source_groups
+
+    def _groups_for(self, scope: str):
+        if self._source_groups is None:
+            self.capture_handlers()
+        if not self._source_groups:
+            return OrderedDict()
+        return wrapped_handlers(self._source_groups, scope)
+
+    def max_clones(self) -> int:
+        try:
+            return int(getattr(config, "MAX_CLONES", 0) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def clones_enabled(self) -> bool:
+        return bool(getattr(config, "CLONE_ENABLED", True))
+
+    # -- lifecycle ---------------------------------------------------------
+    async def start_all(self):
+        """Restore every enabled clone (called once on main-bot startup)."""
+        self.started = True
+        self.capture_handlers()
+        if not self.clones_enabled():
+            LOGGER.info("🧬 Clones disabled (CLONE_ENABLED=false)")
+            return
+        docs = await botdb.list_bots(enabled_only=True)
+        if not docs:
+            return
+        LOGGER.info(f"🧬 Restoring {len(docs)} cloned bot(s)...")
+        for doc in docs:
+            try:
+                await self.start_clone(doc)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error(f"🧬 Could not start clone {doc.get('scope')}: {exc}")
+
+    async def start_clone(self, doc: dict, client=None):
+        """Start one cloned bot from its stored document."""
+        scope = doc.get("scope") or clone_scope(doc.get("bot_id"))
+        if CLIENTS.get(scope) is not None:
+            return CLIENTS[scope]
+
+        async with _lock_for(scope):
+            if CLIENTS.get(scope) is not None:
+                return CLIENTS[scope]
+
+            if client is None:
+                dcs_to_try = [doc.get("target_dc") or getattr(config, "TELEGRAM_DC", 5), 5, 4, 1]
+                dcs_to_try = list(dict.fromkeys(dcs_to_try))
+                last_exc = None
+                for dc_try in dcs_to_try:
+                    c = CloneBotClient(
+                        name=f"clone_{doc.get('bot_id') or scope}",
+                        api_id=config.API_ID,
+                        api_hash=config.API_HASH,
+                        bot_token=doc["token"],
+                        in_memory=True,
+                        parse_mode=ParseMode.DEFAULT,
+                        target_dc=dc_try,
+                    )
+                    try:
+                        await c.start()
+                        client = c
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        LOGGER.warning(f"🧬 Clone start attempt failed on DC {dc_try}: {exc}")
+                        try:
+                            await c.stop()
+                        except Exception:
+                            pass
+                if client is None:
+                    raise last_exc or RuntimeError("Could not connect to Telegram servers")
+            else:
+                await client.start()
+
+            me = await client.get_me()
+            scope = clone_scope(me.id)
+
+            # The handlers are attached only now, so nothing is dispatched with
+            # the wrong scope while the client was still connecting.
+            client.dispatcher.groups = self._groups_for(scope)
+            attach_bot_attrs(client, me)
+            CLIENTS[scope] = client
+
+            try:
+                from Myra.services.commands import publish_commands
+
+                await publish_commands(client, f"clone @{me.username or me.id}")
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug(f"clone command menu failed: {exc}")
+
+            await botdb.register_bot(
+                bot_id=me.id,
+                token=doc["token"],
+                owner_id=doc.get("owner_id"),
+                username=me.username or "",
+                name=client.name,
+            )
+            await botdb.update_bot(scope, {"enabled": True, "last_start": time.time(), "target_dc": getattr(client, "target_dc", 5)})
+            LOGGER.info(
+                f"🧬 Clone started: @{me.username or me.id} "
+                f"(scope {scope}, owner {doc.get('owner_id')})"
+            )
+            return client
+
+    async def create_clone(self, token: str, owner_id: int):
+        """
+        Validate a bot token and start it as a clone.
+
+        Returns ``(ok, message, doc)``.
+        """
+        if not self.clones_enabled():
+            return False, "Cloning is disabled on this bot.", None
+
+        token = (token or "").strip()
+        if not TOKEN_RE.match(token):
+            return False, "That does not look like a bot token.\\nGet one from @BotFather.", None
+        if config.BOT_TOKEN and token == config.BOT_TOKEN.strip():
+            return False, "That is the main bot's own token.", None
+
+        existing = await botdb.list_bots()
+        max_c = self.max_clones()
+        if max_c > 0 and len(existing) >= max_c:
+            return False, f"Clone limit reached ({max_c}).", None
+        if any(doc.get("token") == token for doc in existing):
+            return False, "This bot token is already added.", None
+
+        probe = None
+        me = None
+        target_dc_winner = 5
+        dcs_to_try = [getattr(config, "TELEGRAM_DC", 5), 4, 1]
+        dcs_to_try = list(dict.fromkeys(dcs_to_try))
+        last_exc = None
+
+        for dc_attempt in dcs_to_try:
+            probe = CloneBotClient(
+                name=f"clone_probe_{uuid4().hex[:12]}",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                bot_token=token,
+                in_memory=True,
+                parse_mode=ParseMode.DEFAULT,
+                target_dc=dc_attempt,
+            )
+            try:
+                LOGGER.info(f"🧬 Probing clone token on DC {dc_attempt}...")
+                await probe.start()
+                me = await probe.get_me()
+                target_dc_winner = dc_attempt
+                LOGGER.info(f"✅ Clone probe succeeded on DC {dc_attempt} for @{me.username or me.id}")
+                break
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    await probe.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                last_exc = exc
+                LOGGER.warning(f"⚠️ Clone probe failed on DC {dc_attempt}: {exc}")
+
+        if not me:
+            text = str(last_exc) or last_exc.__class__.__name__ if last_exc else "Connection failed"
+            return False, f"Invalid bot token: {text}", None
+
+        if not getattr(me, "is_bot", False):
+            try:
+                await probe.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            return False, "That token does not belong to a bot.", None
+
+        scope = clone_scope(me.id)
+        if CLIENTS.get(scope) is not None or await botdb.get_bot(scope):
+            try:
+                await probe.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            return False, f"@{me.username or me.id} is already cloned.", None
+
+        try:
+            probe.dispatcher.groups = self._groups_for(scope)
+            attach_bot_attrs(probe, me)
+            CLIENTS[scope] = probe
+            try:
+                from Myra.services.commands import publish_commands
+
+                await publish_commands(probe, f"clone @{me.username or me.id}")
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug(f"clone command menu failed: {exc}")
+
+            doc = await botdb.register_bot(
+                bot_id=me.id,
+                token=token,
+                owner_id=owner_id,
+                username=me.username or "",
+                name=probe.name,
+            )
+            await botdb.update_bot(scope, {"target_dc": target_dc_winner})
+            LOGGER.info(f"🧬 New clone created: @{me.username or me.id} by {owner_id} (scope {scope}, target_dc {target_dc_winner})")
+            return True, f"@{me.username or me.id} is live!", doc
+        except Exception as exc:  # noqa: BLE001
+            CLIENTS.pop(scope, None)
+            try:
+                await probe.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            LOGGER.error(f"🧬 create_clone failed: {exc}")
+            return False, f"Could not start the clone: {exc}", None
+
+    async def stop_clone(self, scope: str) -> bool:
+        """Stop a clone's client (the DB entry stays, so it can be resumed)."""
+        client = CLIENTS.pop(scope, None)
+        if client is None and scope:
+            if scope.startswith("c"):
+                client = CLIENTS.pop(f"clone_{scope[1:]}", None)
+            elif scope.startswith("clone_"):
+                client = CLIENTS.pop(f"c{scope[6:]}", None)
+        try:
+            await botdb.update_bot(scope, {"enabled": False})
+        except Exception:
+            pass
+        if client is not None:
+            try:
+                await client.stop()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug(f"🧬 stop_clone({scope}) error: {exc}")
+        return True
+
+    async def restart_clone(self, scope: str):
+        """Stop and start a clone again from its stored document."""
+        doc = await botdb.get_bot(scope)
+        if not doc:
+            LOGGER.warning(f"🧬 restart_clone: bot not found for scope '{scope}'")
+            return None
+        await self.stop_clone(scope)
+        return await self.start_clone(doc)
+
+    async def delete_clone(self, scope: str, keep_data: bool = False) -> bool:
+        """Stop a clone and forget it (optionally keeping its chats/settings)."""
+        await self.stop_clone(scope)
+        CLIENTS.pop(scope, None)
+        if scope and scope.startswith("c"):
+            CLIENTS.pop(f"clone_{scope[1:]}", None)
+        elif scope and scope.startswith("clone_"):
+            CLIENTS.pop(f"c{scope[6:]}", None)
+        return await botdb.delete_bot(scope)
+
+    async def stop_all(self):
+        """Stop every clone (main-process shutdown)."""
+        for scope in list(CLIENTS.keys()):
+            client = CLIENTS.pop(scope, None)
+            if client is None:
+                continue
+            try:
+                await client.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- info --------------------------------------------------------------
+    async def list_clones(self) -> list:
+        """Stored clones enriched with their live status."""
+        docs = await botdb.list_bots()
+        for doc in docs:
+            scope = doc.get("scope") or clone_scope(doc.get("bot_id"))
+            doc["scope"] = scope
+            doc["running"] = CLIENTS.get(scope) is not None
+        return sorted(docs, key=lambda d: d.get("created_at") or 0)
+
+    def is_running(self, scope: str) -> bool:
+        if CLIENTS.get(scope) is not None:
+            return True
+        if scope and scope.startswith("c"):
+            return CLIENTS.get(f"clone_{scope[1:]}") is not None
+        if scope and scope.startswith("clone_"):
+            return CLIENTS.get(f"c{scope[6:]}") is not None
+        return False
+
+
+clone_manager = CloneManager()
+
+__all__ = [
+    "TOKEN_RE",
+    "CLIENTS",
+    "CloneManager",
+    "clone_manager",
+    "bot_client_for",
+    "running_scopes",
+    "wrap_callback",
+    "wrapped_handlers",
+    "attach_bot_attrs",
+]
